@@ -1,6 +1,5 @@
 hello,i am boy
     .boy2
-    .boy5
     .boy4
     .girl1
     .girl2
