@@ -23,7 +23,7 @@ public class HelloworldController{
         for(ConstraintViolation cv :s){
             System.out.println(cv);
         }
-        return "Hello "+myResponseBody.getContent()+" World !"+myResponseBody.getUrl();
+        return "Hello "+myResponseBody.getContent()+" World !";
     }
     @RequestMapping(value = "/printServiceId",method = {RequestMethod.GET})
     String printServiceId(){

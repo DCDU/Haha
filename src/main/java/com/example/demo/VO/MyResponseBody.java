@@ -8,21 +8,10 @@ import org.springframework.stereotype.Component;
 public class MyResponseBody {
     String url;
     @UrlValid
-    String content;
+    Content content;
 
-    public String getUrl() {
-        return url;
-    }
 
-    public void setUrl(String url) {
-        this.url = url;
-    }
-
-    public String getContent() {
+    public Content getContent() {
         return content;
-    }
-
-    public void setContent(String content) {
-        this.content = content;
     }
 }
