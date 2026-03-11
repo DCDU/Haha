@@ -1,0 +1,299 @@
+import com.bertramlabs.plugins.hcl4j.HCLParser;
+import com.bertramlabs.plugins.hcl4j.symbols.Symbol;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+public class TerraformTemplateAnalyzer {
+    private static final Set<String> MODULE_META_ARGS = Set.of(
+        "source", "version", "providers", "depends_on", "count", "for_each"
+    );
+
+    public static void main(String[] args) throws Exception {
+        Path workspace = args.length > 0
+            ? Paths.get(args[0]).toAbsolutePath().normalize()
+            : Paths.get(".").toAbsolutePath().normalize();
+
+        Analyzer analyzer = new Analyzer(workspace);
+        List<Path> roots = discoverTemplateRoots(workspace);
+        List<Object> templates = new ArrayList<>();
+        for (Path root : roots) {
+            templates.add(analyzer.analyzeModule(root, root.getFileName().toString(), Collections.emptyMap()));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("generatedAt", Instant.now().toString());
+        result.put("workspace", workspace.toString());
+        result.put("library", Map.of(
+            "name", "hcl4j",
+            "artifact", "com.bertramlabs.plugins:hcl4j:0.9.4"
+        ));
+        result.put("templates", templates);
+
+        ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+        Path output = workspace.resolve("terraform-analysis-result.json");
+        mapper.writeValue(output.toFile(), result);
+        System.out.println("Wrote analysis to " + output);
+    }
+
+    private static List<Path> discoverTemplateRoots(Path workspace) throws IOException {
+        try (var stream = Files.list(workspace)) {
+            return stream
+                .filter(Files::isDirectory)
+                .filter(path -> !path.getFileName().toString().startsWith("."))
+                .filter(path -> Files.exists(path.resolve("main.tf")))
+                .sorted(Comparator.comparing(path -> path.getFileName().toString()))
+                .collect(Collectors.toList());
+        }
+    }
+
+    private static final class Analyzer {
+        private final Path workspace;
+        private final LinkedHashSet<Path> stack = new LinkedHashSet<>();
+
+        private Analyzer(Path workspace) {
+            this.workspace = workspace;
+        }
+
+        private Map<String, Object> analyzeModule(Path dir, String moduleName, Map<String, Object> inputs) throws Exception {
+            Path normalized = dir.toAbsolutePath().normalize();
+            if (!stack.add(normalized)) {
+                return Map.of(
+                    "name", moduleName,
+                    "path", workspace.relativize(normalized).toString(),
+                    "status", "cycle",
+                    "note", "cyclic module reference"
+                );
+            }
+
+            try {
+                String combinedTf = readCombinedTf(normalized);
+                Map<String, Object> firstPass = parseWithVariables(combinedTf, inputs);
+                Map<String, Object> effectiveVariables = buildEffectiveVariables(firstPass, inputs);
+                Map<String, Object> parsed = effectiveVariables.equals(inputs)
+                    ? firstPass
+                    : parseWithVariables(combinedTf, effectiveVariables);
+
+                Map<String, Object> moduleJson = new LinkedHashMap<>();
+                moduleJson.put("name", moduleName);
+                moduleJson.put("path", workspace.relativize(normalized).toString());
+                moduleJson.put("files", listTfFiles(normalized));
+                moduleJson.put("inputVariables", sanitize(inputs));
+                moduleJson.put("variables", buildVariablesJson(parsed, inputs, effectiveVariables));
+                moduleJson.put("locals", sanitize(mapValue(parsed.get("locals"))));
+                moduleJson.put("data", flattenBlocks(mapValue(parsed.get("data")), "data"));
+                moduleJson.put("resources", flattenBlocks(mapValue(parsed.get("resource")), "resource"));
+                moduleJson.put("outputs", sanitize(mapValue(parsed.get("output"))));
+                moduleJson.put("modules", buildModulesJson(normalized, mapValue(parsed.get("module"))));
+                return moduleJson;
+            } finally {
+                stack.remove(normalized);
+            }
+        }
+
+        private List<Object> buildModulesJson(Path dir, Map<String, Object> modules) throws Exception {
+            List<Object> result = new ArrayList<>();
+            for (Map.Entry<String, Object> entry : modules.entrySet()) {
+                Map<String, Object> attrs = mapValue(entry.getValue());
+                Object source = attrs.get("source");
+
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("name", entry.getKey());
+                item.put("source", sanitize(source));
+
+                Map<String, Object> childInputs = new LinkedHashMap<>();
+                for (Map.Entry<String, Object> attr : attrs.entrySet()) {
+                    if (!MODULE_META_ARGS.contains(attr.getKey())) {
+                        childInputs.put(attr.getKey(), attr.getValue());
+                    }
+                }
+                item.put("inputs", sanitize(childInputs));
+
+                if (source instanceof String) {
+                    Path moduleDir = dir.resolve((String) source).normalize();
+                    if (Files.isDirectory(moduleDir)) {
+                        item.put("module", analyzeModule(moduleDir, entry.getKey(), childInputs));
+                    } else {
+                        item.put("module", Map.of(
+                            "status", "unresolved",
+                            "note", "module source is not a local directory",
+                            "path", moduleDir.toString()
+                        ));
+                    }
+                } else {
+                    item.put("module", Map.of(
+                        "status", "unresolved",
+                        "note", "module source is not statically resolvable"
+                    ));
+                }
+                result.add(item);
+            }
+            return result;
+        }
+
+        private Map<String, Object> buildVariablesJson(Map<String, Object> parsed, Map<String, Object> providedInputs, Map<String, Object> effectiveVariables) {
+            Map<String, Object> variables = new LinkedHashMap<>();
+            Map<String, Object> definitions = mapValue(parsed.get("variable"));
+            for (Map.Entry<String, Object> entry : definitions.entrySet()) {
+                Map<String, Object> definition = mapValue(entry.getValue());
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("definition", sanitize(definition));
+                item.put("provided", providedInputs.containsKey(entry.getKey()));
+                item.put("effectiveValue", sanitize(effectiveVariables.get(entry.getKey())));
+                variables.put(entry.getKey(), item);
+            }
+            return variables;
+        }
+
+        private Map<String, Object> buildEffectiveVariables(Map<String, Object> parsed, Map<String, Object> providedInputs) {
+            Map<String, Object> effective = new LinkedHashMap<>(providedInputs);
+            Map<String, Object> definitions = mapValue(parsed.get("variable"));
+            for (Map.Entry<String, Object> entry : definitions.entrySet()) {
+                if (!effective.containsKey(entry.getKey())) {
+                    Map<String, Object> definition = mapValue(entry.getValue());
+                    if (definition.containsKey("default")) {
+                        effective.put(entry.getKey(), definition.get("default"));
+                    }
+                }
+            }
+            return effective;
+        }
+
+        private List<Object> flattenBlocks(Map<String, Object> groups, String kind) {
+            List<Object> items = new ArrayList<>();
+            for (Map.Entry<String, Object> typeEntry : groups.entrySet()) {
+                Map<String, Object> blocks = mapValue(typeEntry.getValue());
+                for (Map.Entry<String, Object> blockEntry : blocks.entrySet()) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("kind", kind);
+                    item.put("type", typeEntry.getKey());
+                    item.put("name", blockEntry.getKey());
+                    item.put("values", sanitize(blockEntry.getValue()));
+                    items.add(item);
+                }
+            }
+            return items;
+        }
+
+        private List<String> listTfFiles(Path dir) throws IOException {
+            try (var stream = Files.list(dir)) {
+                return stream
+                    .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".tf"))
+                    .sorted(Comparator.comparing(path -> path.getFileName().toString()))
+                    .map(path -> workspace.relativize(path.toAbsolutePath().normalize()).toString())
+                    .collect(Collectors.toList());
+            }
+        }
+
+        private String readCombinedTf(Path dir) throws IOException {
+            List<Path> files;
+            try (var stream = Files.list(dir)) {
+                files = stream
+                    .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".tf"))
+                    .sorted(Comparator.comparing(path -> path.getFileName().toString()))
+                    .collect(Collectors.toList());
+            }
+
+            StringBuilder builder = new StringBuilder();
+            for (Path file : files) {
+                builder.append("# file: ").append(file.getFileName()).append('\n');
+                builder.append(new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
+                builder.append("\n\n");
+            }
+            return builder.toString();
+        }
+
+        @SuppressWarnings("unchecked")
+        private Map<String, Object> mapValue(Object value) {
+            return value instanceof Map<?, ?> ? (Map<String, Object>) value : Collections.emptyMap();
+        }
+
+        private Map<String, Object> parseWithVariables(String combinedTf, Map<String, Object> variables) throws Exception {
+            HCLParser parser = new HCLParser();
+            parser.setVariables(variables);
+            PrintStream originalOut = System.out;
+            ByteArrayOutputStream sink = new ByteArrayOutputStream();
+            try {
+                System.setOut(new PrintStream(sink, true, StandardCharsets.UTF_8.name()));
+                return parser.parse(combinedTf, true);
+            } finally {
+                System.setOut(originalOut);
+            }
+        }
+
+        private Object sanitize(Object value) {
+            return sanitize(value, Collections.newSetFromMap(new IdentityHashMap<>()));
+        }
+
+        private Object sanitize(Object value, Set<Object> seen) {
+            if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) {
+                return value;
+            }
+            if (seen.contains(value)) {
+                return Map.of("status", "cycle");
+            }
+            if (value instanceof Symbol) {
+                Symbol symbol = (Symbol) value;
+                Map<String, Object> json = new LinkedHashMap<>();
+                json.put("status", "unresolved");
+                json.put("symbolType", symbol.getClass().getSimpleName());
+                json.put("expression", value.toString());
+                if (symbol.getLine() != null) {
+                    json.put("line", symbol.getLine());
+                }
+                if (symbol.getColumn() != null) {
+                    json.put("column", symbol.getColumn());
+                }
+                if (symbol.getName() != null) {
+                    json.put("name", symbol.getName());
+                }
+                return json;
+            }
+
+            seen.add(value);
+            try {
+                if (value instanceof Map<?, ?>) {
+                    Map<String, Object> json = new LinkedHashMap<>();
+                    for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                        json.put(String.valueOf(entry.getKey()), sanitize(entry.getValue(), seen));
+                    }
+                    return json;
+                }
+                if (value instanceof Collection<?>) {
+                    List<Object> json = new ArrayList<>();
+                    for (Object item : (Collection<?>) value) {
+                        json.add(sanitize(item, seen));
+                    }
+                    return json;
+                }
+                return Map.of(
+                    "status", "unresolved",
+                    "javaType", value.getClass().getName(),
+                    "value", String.valueOf(value)
+                );
+            } finally {
+                seen.remove(value);
+            }
+        }
+    }
+}
