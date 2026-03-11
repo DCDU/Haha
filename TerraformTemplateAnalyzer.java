@@ -76,14 +76,19 @@ public class TerraformTemplateAnalyzer {
         }
 
         private Map<String, Object> analyzeModule(Path dir, String moduleName, Map<String, Object> inputs) throws Exception {
+            return analyzeModuleInternal(dir, moduleName, inputs).json;
+        }
+
+        private ModuleAnalysis analyzeModuleInternal(Path dir, String moduleName, Map<String, Object> inputs) throws Exception {
             Path normalized = dir.toAbsolutePath().normalize();
             if (!stack.add(normalized)) {
-                return Map.of(
+                Map<String, Object> cycle = Map.of(
                     "name", moduleName,
                     "path", workspace.relativize(normalized).toString(),
                     "status", "cycle",
                     "note", "cyclic module reference"
                 );
+                return new ModuleAnalysis(cycle, new ArrayList<>(), new ArrayList<>());
             }
 
             try {
@@ -101,25 +106,22 @@ public class TerraformTemplateAnalyzer {
                 moduleJson.put("inputVariables", sanitize(inputs));
                 moduleJson.put("variables", buildVariablesJson(parsed, inputs, effectiveVariables));
                 moduleJson.put("locals", sanitize(mapValue(parsed.get("locals"))));
-                moduleJson.put("data", flattenBlocks(mapValue(parsed.get("data")), "data"));
-                moduleJson.put("resources", flattenBlocks(mapValue(parsed.get("resource")), "resource"));
+                List<Object> aggregatedData = flattenBlocks(mapValue(parsed.get("data")), "data", workspace.relativize(normalized).toString());
+                List<Object> aggregatedResources = flattenBlocks(mapValue(parsed.get("resource")), "resource", workspace.relativize(normalized).toString());
                 moduleJson.put("outputs", sanitize(mapValue(parsed.get("output"))));
-                moduleJson.put("modules", buildModulesJson(normalized, mapValue(parsed.get("module"))));
-                return moduleJson;
+                mergeChildModules(normalized, mapValue(parsed.get("module")), aggregatedData, aggregatedResources);
+                moduleJson.put("data", aggregatedData);
+                moduleJson.put("resources", aggregatedResources);
+                return new ModuleAnalysis(moduleJson, aggregatedData, aggregatedResources);
             } finally {
                 stack.remove(normalized);
             }
         }
 
-        private List<Object> buildModulesJson(Path dir, Map<String, Object> modules) throws Exception {
-            List<Object> result = new ArrayList<>();
+        private void mergeChildModules(Path dir, Map<String, Object> modules, List<Object> aggregatedData, List<Object> aggregatedResources) throws Exception {
             for (Map.Entry<String, Object> entry : modules.entrySet()) {
                 Map<String, Object> attrs = mapValue(entry.getValue());
                 Object source = attrs.get("source");
-
-                Map<String, Object> item = new LinkedHashMap<>();
-                item.put("name", entry.getKey());
-                item.put("source", sanitize(source));
 
                 Map<String, Object> childInputs = new LinkedHashMap<>();
                 for (Map.Entry<String, Object> attr : attrs.entrySet()) {
@@ -127,28 +129,16 @@ public class TerraformTemplateAnalyzer {
                         childInputs.put(attr.getKey(), attr.getValue());
                     }
                 }
-                item.put("inputs", sanitize(childInputs));
 
                 if (source instanceof String) {
                     Path moduleDir = dir.resolve((String) source).normalize();
                     if (Files.isDirectory(moduleDir)) {
-                        item.put("module", analyzeModule(moduleDir, entry.getKey(), childInputs));
-                    } else {
-                        item.put("module", Map.of(
-                            "status", "unresolved",
-                            "note", "module source is not a local directory",
-                            "path", moduleDir.toString()
-                        ));
+                        ModuleAnalysis child = analyzeModuleInternal(moduleDir, entry.getKey(), childInputs);
+                        aggregatedData.addAll(child.data);
+                        aggregatedResources.addAll(child.resources);
                     }
-                } else {
-                    item.put("module", Map.of(
-                        "status", "unresolved",
-                        "note", "module source is not statically resolvable"
-                    ));
                 }
-                result.add(item);
             }
-            return result;
         }
 
         private Map<String, Object> buildVariablesJson(Map<String, Object> parsed, Map<String, Object> providedInputs, Map<String, Object> effectiveVariables) {
@@ -179,12 +169,13 @@ public class TerraformTemplateAnalyzer {
             return effective;
         }
 
-        private List<Object> flattenBlocks(Map<String, Object> groups, String kind) {
+        private List<Object> flattenBlocks(Map<String, Object> groups, String kind, String modulePath) {
             List<Object> items = new ArrayList<>();
             for (Map.Entry<String, Object> typeEntry : groups.entrySet()) {
                 Map<String, Object> blocks = mapValue(typeEntry.getValue());
                 for (Map.Entry<String, Object> blockEntry : blocks.entrySet()) {
                     Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("modulePath", modulePath);
                     item.put("kind", kind);
                     item.put("type", typeEntry.getKey());
                     item.put("name", blockEntry.getKey());
@@ -258,12 +249,6 @@ public class TerraformTemplateAnalyzer {
                 json.put("status", "unresolved");
                 json.put("symbolType", symbol.getClass().getSimpleName());
                 json.put("expression", value.toString());
-                if (symbol.getLine() != null) {
-                    json.put("line", symbol.getLine());
-                }
-                if (symbol.getColumn() != null) {
-                    json.put("column", symbol.getColumn());
-                }
                 if (symbol.getName() != null) {
                     json.put("name", symbol.getName());
                 }
@@ -293,6 +278,18 @@ public class TerraformTemplateAnalyzer {
                 );
             } finally {
                 seen.remove(value);
+            }
+        }
+
+        private static final class ModuleAnalysis {
+            private final Map<String, Object> json;
+            private final List<Object> data;
+            private final List<Object> resources;
+
+            private ModuleAnalysis(Map<String, Object> json, List<Object> data, List<Object> resources) {
+                this.json = json;
+                this.data = data;
+                this.resources = resources;
             }
         }
     }
