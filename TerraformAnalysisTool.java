@@ -24,6 +24,8 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 public final class TerraformAnalysisTool {
+    private static final Object HCL_PARSE_LOCK = new Object();
+    private static final int MAX_TF_FILES = 100;
     private static final Set<String> MODULE_META_ARGS = Set.of(
         "source", "version", "providers", "depends_on", "count", "for_each"
     );
@@ -35,11 +37,28 @@ public final class TerraformAnalysisTool {
     }
 
     public String analyzeToJson(String filePath) throws Exception {
-        return analyzeToJson(Paths.get(filePath));
+        return analyzePathToJson(Paths.get(filePath));
     }
 
     public String analyzeToJson(Path filePath) throws Exception {
-        Path workspace = resolveWorkspace(filePath);
+        return analyzePathToJson(filePath);
+    }
+
+    public String analyzePathToJson(String filePath) throws Exception {
+        return analyzePathToJson(Paths.get(filePath));
+    }
+
+    public String analyzePathToJson(Path filePath) throws Exception {
+        Path workspace = resolveWorkspaceFromPath(filePath);
+        return analyzeWorkspaceToJson(workspace);
+    }
+
+    public String analyzeWorkspaceToJson(String workspacePath) throws Exception {
+        return analyzeWorkspaceToJson(Paths.get(workspacePath));
+    }
+
+    public String analyzeWorkspaceToJson(Path workspacePath) throws Exception {
+        Path workspace = resolveWorkspaceDirectory(workspacePath);
         Analyzer analyzer = new Analyzer(workspace);
         List<Path> roots = discoverTemplateRoots(workspace);
         List<Object> templates = new ArrayList<>();
@@ -58,9 +77,31 @@ public final class TerraformAnalysisTool {
         return mapper.writeValueAsString(result);
     }
 
-    private static Path resolveWorkspace(Path filePath) {
+    private static Path resolveWorkspaceFromPath(Path filePath) throws TerraformAnalysisException {
         Path normalized = filePath.toAbsolutePath().normalize();
-        return Files.isDirectory(normalized) ? normalized : normalized.getParent();
+        if (Files.isDirectory(normalized)) {
+            return resolveWorkspaceDirectory(normalized);
+        }
+        Path parent = normalized.getParent();
+        if (parent == null) {
+            throw new InvalidInputPathException("Input path has no parent directory: " + normalized);
+        }
+        return resolveWorkspaceDirectory(parent);
+    }
+
+    private static Path resolveWorkspaceDirectory(Path workspacePath) throws TerraformAnalysisException {
+        Path normalized = workspacePath.toAbsolutePath().normalize();
+        if (!Files.exists(normalized)) {
+            throw new InvalidInputPathException("Path does not exist: " + normalized);
+        }
+        if (!Files.isDirectory(normalized)) {
+            throw new InvalidInputPathException("Workspace path is not a directory: " + normalized);
+        }
+        try {
+            return normalized.toRealPath();
+        } catch (IOException ex) {
+            throw new InvalidInputPathException("Failed to resolve workspace path: " + normalized, ex);
+        }
     }
 
     private static List<Path> discoverTemplateRoots(Path workspace) throws IOException {
@@ -77,17 +118,29 @@ public final class TerraformAnalysisTool {
     private static final class Analyzer {
         private final Path workspace;
         private final LinkedHashSet<Path> stack = new LinkedHashSet<>();
+        private final Map<ModuleCacheKey, ModuleAnalysis> cache = new LinkedHashMap<>();
+        private int parsedTfFileCount;
 
         private Analyzer(Path workspace) {
             this.workspace = workspace;
         }
 
-        private Map<String, Object> analyzeModule(Path dir, String moduleName, Map<String, Object> inputs) throws Exception {
+        private Map<String, Object> analyzeModule(Path dir, String moduleName, Map<String, Object> inputs) throws TerraformAnalysisException {
             return analyzeModuleInternal(dir, moduleName, inputs).json;
         }
 
-        private ModuleAnalysis analyzeModuleInternal(Path dir, String moduleName, Map<String, Object> inputs) throws Exception {
-            Path normalized = dir.toAbsolutePath().normalize();
+        private ModuleAnalysis analyzeModuleInternal(Path dir, String moduleName, Map<String, Object> inputs) throws TerraformAnalysisException {
+            Path normalized = resolveRealDirectory(dir);
+            ModuleCacheKey cacheKey;
+            try {
+                cacheKey = new ModuleCacheKey(normalized, cacheKeyInputs(inputs));
+            } catch (IOException ex) {
+                throw new TerraformParseException("Failed to build module cache key", ex);
+            }
+            ModuleAnalysis cached = cache.get(cacheKey);
+            if (cached != null) {
+                return cached.copyFor(moduleName);
+            }
             if (!stack.add(normalized)) {
                 Map<String, Object> cycle = Map.of(
                     "name", moduleName,
@@ -120,13 +173,15 @@ public final class TerraformAnalysisTool {
                 mergeChildModules(normalized, mapValue(parsed.get("module")), aggregatedData, aggregatedResources);
                 moduleJson.put("data", aggregatedData);
                 moduleJson.put("resources", aggregatedResources);
-                return new ModuleAnalysis(moduleJson, aggregatedData, aggregatedResources);
+                ModuleAnalysis analysis = new ModuleAnalysis(moduleJson, aggregatedData, aggregatedResources);
+                cache.put(cacheKey, analysis);
+                return analysis.copyFor(moduleName);
             } finally {
                 stack.remove(normalized);
             }
         }
 
-        private void mergeChildModules(Path dir, Map<String, Object> modules, List<Object> aggregatedData, List<Object> aggregatedResources) throws Exception {
+        private void mergeChildModules(Path dir, Map<String, Object> modules, List<Object> aggregatedData, List<Object> aggregatedResources) throws TerraformAnalysisException {
             for (Map.Entry<String, Object> entry : modules.entrySet()) {
                 Map<String, Object> attrs = mapValue(entry.getValue());
                 Object source = attrs.get("source");
@@ -140,7 +195,7 @@ public final class TerraformAnalysisTool {
 
                 if (source instanceof String) {
                     Path moduleDir = dir.resolve((String) source).normalize();
-                    if (Files.isDirectory(moduleDir)) {
+                    if (isWorkspaceLocalDirectory(moduleDir)) {
                         ModuleAnalysis child = analyzeModuleInternal(moduleDir, entry.getKey(), childInputs);
                         aggregatedData.addAll(child.data);
                         aggregatedResources.addAll(child.resources);
@@ -194,30 +249,43 @@ public final class TerraformAnalysisTool {
             return items;
         }
 
-        private List<String> listTfFiles(Path dir) throws IOException {
+        private List<String> listTfFiles(Path dir) throws TerraformAnalysisException {
             try (var stream = Files.list(dir)) {
                 return stream
                     .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".tf"))
                     .sorted(Comparator.comparing(path -> path.getFileName().toString()))
                     .map(path -> workspace.relativize(path.toAbsolutePath().normalize()).toString())
                     .collect(Collectors.toList());
+            } catch (IOException ex) {
+                throw new TerraformParseException("Failed to list Terraform files in directory: " + dir, ex);
             }
         }
 
-        private String readCombinedTf(Path dir) throws IOException {
+        private String readCombinedTf(Path dir) throws TerraformAnalysisException {
             List<Path> files;
             try (var stream = Files.list(dir)) {
                 files = stream
                     .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".tf"))
                     .sorted(Comparator.comparing(path -> path.getFileName().toString()))
                     .collect(Collectors.toList());
+            } catch (IOException ex) {
+                throw new ParseLimitExceededException("Failed to list .tf files in directory: " + dir, ex);
+            }
+
+            parsedTfFileCount += files.size();
+            if (parsedTfFileCount > MAX_TF_FILES) {
+                throw new ParseLimitExceededException("Too many .tf files to analyze: " + parsedTfFileCount + " > " + MAX_TF_FILES);
             }
 
             StringBuilder builder = new StringBuilder();
             for (Path file : files) {
-                builder.append("# file: ").append(file.getFileName()).append('\n');
-                builder.append(new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
-                builder.append("\n\n");
+                try {
+                    builder.append("# file: ").append(file.getFileName()).append('\n');
+                    builder.append(new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
+                    builder.append("\n\n");
+                } catch (IOException ex) {
+                    throw new ParseLimitExceededException("Failed to read .tf file: " + file, ex);
+                }
             }
             return builder.toString();
         }
@@ -227,16 +295,50 @@ public final class TerraformAnalysisTool {
             return value instanceof Map<?, ?> ? (Map<String, Object>) value : Collections.emptyMap();
         }
 
-        private Map<String, Object> parseWithVariables(String combinedTf, Map<String, Object> variables) throws Exception {
+        private Map<String, Object> parseWithVariables(String combinedTf, Map<String, Object> variables) throws TerraformAnalysisException {
             HCLParser parser = new HCLParser();
             parser.setVariables(variables);
-            PrintStream originalOut = System.out;
-            ByteArrayOutputStream sink = new ByteArrayOutputStream();
             try {
-                System.setOut(new PrintStream(sink, true, StandardCharsets.UTF_8.name()));
-                return parser.parse(combinedTf, true);
-            } finally {
-                System.setOut(originalOut);
+                synchronized (HCL_PARSE_LOCK) {
+                    PrintStream originalOut = System.out;
+                    ByteArrayOutputStream sink = new ByteArrayOutputStream();
+                    try {
+                        System.setOut(new PrintStream(sink, true, StandardCharsets.UTF_8.name()));
+                        return parser.parse(combinedTf, true);
+                    } finally {
+                        System.setOut(originalOut);
+                    }
+                }
+            } catch (Exception ex) {
+                throw new TerraformParseException("Failed to parse Terraform content", ex);
+            }
+        }
+
+        private String cacheKeyInputs(Map<String, Object> inputs) throws IOException {
+            return new ObjectMapper().writeValueAsString(sanitize(inputs));
+        }
+
+        private Path resolveRealDirectory(Path dir) throws TerraformAnalysisException {
+            Path normalized = dir.toAbsolutePath().normalize();
+            if (!Files.exists(normalized)) {
+                throw new InvalidInputPathException("Module path does not exist: " + normalized);
+            }
+            if (!Files.isDirectory(normalized)) {
+                throw new InvalidInputPathException("Module path is not a directory: " + normalized);
+            }
+            try {
+                return normalized.toRealPath();
+            } catch (IOException ex) {
+                throw new InvalidInputPathException("Failed to resolve module path: " + normalized, ex);
+            }
+        }
+
+        private boolean isWorkspaceLocalDirectory(Path dir) {
+            try {
+                Path realPath = dir.toRealPath();
+                return realPath.startsWith(workspace) && Files.isDirectory(realPath);
+            } catch (IOException ex) {
+                return false;
             }
         }
 
@@ -299,6 +401,75 @@ public final class TerraformAnalysisTool {
                 this.data = data;
                 this.resources = resources;
             }
+
+            private ModuleAnalysis copyFor(String moduleName) {
+                Map<String, Object> jsonCopy = new LinkedHashMap<>(json);
+                jsonCopy.put("name", moduleName);
+                return new ModuleAnalysis(jsonCopy, new ArrayList<>(data), new ArrayList<>(resources));
+            }
+        }
+
+        private static final class ModuleCacheKey {
+            private final Path path;
+            private final String inputsKey;
+
+            private ModuleCacheKey(Path path, String inputsKey) {
+                this.path = path;
+                this.inputsKey = inputsKey;
+            }
+
+            @Override
+            public boolean equals(Object obj) {
+                if (this == obj) {
+                    return true;
+                }
+                if (!(obj instanceof ModuleCacheKey)) {
+                    return false;
+                }
+                ModuleCacheKey other = (ModuleCacheKey) obj;
+                return path.equals(other.path) && inputsKey.equals(other.inputsKey);
+            }
+
+            @Override
+            public int hashCode() {
+                return 31 * path.hashCode() + inputsKey.hashCode();
+            }
+        }
+    }
+
+    public static class TerraformAnalysisException extends Exception {
+        public TerraformAnalysisException(String message) {
+            super(message);
+        }
+
+        public TerraformAnalysisException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public static final class InvalidInputPathException extends TerraformAnalysisException {
+        public InvalidInputPathException(String message) {
+            super(message);
+        }
+
+        public InvalidInputPathException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public static final class ParseLimitExceededException extends TerraformAnalysisException {
+        public ParseLimitExceededException(String message) {
+            super(message);
+        }
+
+        public ParseLimitExceededException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public static final class TerraformParseException extends TerraformAnalysisException {
+        public TerraformParseException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 }
